@@ -1,0 +1,202 @@
+# Self-hosted Infisical for the demo: Postgres, Redis, Infisical, and a token
+# reviewer for Kubernetes Auth. Demo cluster only.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: infisical
+---
+# Fill in every CHANGE-ME before applying.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: infisical-secrets
+  namespace: infisical
+stringData:
+  # Pick a password with letters and numbers only, so it works in the URLs below
+  # without encoding. Use the same one in all four places.
+  POSTGRES_PASSWORD: CHANGE-ME
+  REDIS_PASSWORD: CHANGE-ME
+  DB_CONNECTION_URI: postgresql://infisical:CHANGE-ME@postgres:5432/infisical
+  REDIS_URL: redis://:CHANGE-ME@redis:6379
+  ENCRYPTION_KEY: CHANGE-ME # openssl rand -hex 16
+  AUTH_SECRET: CHANGE-ME # openssl rand -base64 32
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres
+  namespace: infisical
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: infisical
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          env:
+            - name: POSTGRES_DB
+              value: infisical
+            - name: POSTGRES_USER
+              value: infisical
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: infisical-secrets
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA # a subfolder, so the disk's lost+found doesn't block initdb
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: infisical
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: infisical
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:8.10-alpine
+          args: ["--requirepass", "$(REDIS_PASSWORD)", "--save", "", "--appendonly", "no"]   # password required, nothing written to disk
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: infisical-secrets
+                  key: REDIS_PASSWORD
+          ports:
+            - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: infisical
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: infisical
+  namespace: infisical
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: infisical
+  template:
+    metadata:
+      labels:
+        app: infisical
+    spec:
+      containers:
+        - name: infisical
+          image: infisical/infisical:v0.167.4
+          envFrom:
+            - secretRef:
+                name: infisical-secrets
+          env:
+            - name: SITE_URL # you reach the UI with port-forward
+              value: http://localhost:8080
+            # Kubernetes Auth reviews tokens at https://kubernetes.default.svc, a private IP.
+            - name: ALLOW_INTERNAL_IP_CONNECTIONS
+              value: "true"
+            - name: TELEMETRY_ENABLED
+              value: "false"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infisical
+  namespace: infisical
+spec:
+  selector:
+    app: infisical
+  ports:
+    - port: 8080
+---
+# Lets Infisical verify sandbox ServiceAccount tokens (Kubernetes Auth).
+# Its only permission is TokenReview.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: infisical-token-reviewer
+  namespace: infisical
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: infisical-token-reviewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: infisical-token-reviewer
+    namespace: infisical
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: infisical-token-reviewer
+  namespace: infisical
+  annotations:
+    kubernetes.io/service-account.name: infisical-token-reviewer
+type: kubernetes.io/service-account-token  # Kubernetes fills in the token

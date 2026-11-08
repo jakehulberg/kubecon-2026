@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agents
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: llm-api-key
+  namespace: agents
+stringData:
+  LLM_API_KEY: sk-demo-THIS-IS-THE-REAL-KEY
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: agent-before
+  namespace: agents
+  labels:
+    app: agent-before
+spec:
+  # default ServiceAccount, token automounted
+  # default runtime (shares the node's kernel)
+  # no NetworkPolicy or resource limits
+  containers:
+    - name: agent
+      image: curlimages/curl:8.22.0
+      command: ["sleep", "infinity"]
+      envFrom:
+        - secretRef:
+            name: llm-api-key

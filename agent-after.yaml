@@ -1,0 +1,187 @@
+# Layer 2: Identity. Its own ServiceAccount, no RBAC bindings, no API token mounted.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coding-agent
+  namespace: agents
+automountServiceAccountToken: false
+---
+# Layer 3: Session settings for the sidecar. Not secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-session
+  namespace: agents
+data:
+  # Short names: on GKE's gVisor nodes, full .svc.cluster.local names walk the
+  # search domains and time out.
+  INFISICAL_URL: http://infisical.infisical:8080
+  # Replace with your own Infisical machine identity's ID. Give it Kubernetes
+  # Auth allowing namespace 'agents', ServiceAccount
+  # 'coding-agent', audience 'infisical'.
+  IDENTITY_ID: 8bfc1dee-e3ae-418d-9851-f42f01022f7f
+  # The access bundle the identity is a member of.
+  ACCESS_BUNDLE: kubecon-demo
+  PROXY_ADDR: agent-vault-proxy.agent-vault:17323
+  # Replace with your own Agent Vault proxy's CA fingerprint. Pinned, so the
+  # sidecar only trusts your proxy.
+  CA_FINGERPRINT: SHA256:9E:3C:2F:96:21:72:CC:44:EB:3A:57:34:45:81:61:33:21:F1:68:BB:CE:95:E9:1B:79:23:D5:8E:9B:D0:8D:7F
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: coding-agent
+  namespace: agents
+spec:
+  podTemplate:
+    spec:
+      # Layer 1: Isolation. gVisor gives the agent its own user-space kernel.
+      runtimeClassName: gvisor
+      # Layer 2: Identity. agent-sandbox already turns off the token by default;
+      # set here so it doesn't depend on that.
+      serviceAccountName: coding-agent
+      automountServiceAccountToken: false
+      # Both containers run as the image's "node" user, so the agent can read
+      # the CA file the sidecar writes.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+        # Layer 3: Credentials. A sidecar holds the pod's identity and opens an
+        # Agent Vault session; the agent container only ever sees the session.
+        # When the pod shuts down, the sidecar exits and the session is revoked.
+        - name: session
+          image: infisical/cli:0.44.9
+          restartPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: agent-session
+          env:
+            - name: HOME
+              value: /tmp
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -e
+              # Log in to Infisical as this pod's ServiceAccount (Kubernetes Auth).
+              export INFISICAL_TOKEN="$(infisical login --method=kubernetes \
+                --machine-identity-id="$IDENTITY_ID" \
+                --service-account-token-path=/var/run/infisical/token \
+                --domain="$INFISICAL_URL" --plain --silent)"
+              # Open a session over the access bundle and hand the agent only the
+              # proxy settings. 'run' revokes the session when its child exits.
+              exec infisical agent-vault run --domain="$INFISICAL_URL" \
+                --access-bundle "$ACCESS_BUNDLE" --proxy "$PROXY_ADDR" \
+                --ca-fingerprint "$CA_FINGERPRINT" \
+                --ttl 1h --ca-file /session/ca.pem -- sh -c '
+                env | grep -E "^(HTTPS_PROXY|HTTP_PROXY|https_proxy|http_proxy|NO_PROXY|no_proxy|SSL_CERT_FILE|NODE_EXTRA_CA_CERTS|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|GIT_SSL_CAINFO)=" \
+                  | awk "{ k=\$0; sub(/=.*/, \"\", k); v=\$0; sub(/^[^=]*=/, \"\", v); printf \"export %s=\\047%s\\047\\n\", k, v }" \
+                  > /session/env.tmp
+                mv /session/env.tmp /session/env
+                trap "exit 0" TERM
+                while :; do sleep 3600 & wait $!; done'
+          startupProbe:
+            exec:
+              command: ["test", "-f", "/session/env"]
+            periodSeconds: 1
+            failureThreshold: 90
+          resources:
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: infisical-token
+              mountPath: /var/run/infisical
+              readOnly: true
+            - name: session
+              mountPath: /session
+      containers:
+        - name: agent
+          # Claude Code on a Node base image. Swap in your own agent image; it
+          # needs sh and to run as UID 1000 (see securityContext above).
+          image: ghcr.io/jakehulberg/agent-claude:20261101T231015-c8a08a8
+          env:
+            # Interactive shells load the session's proxy settings.
+            - name: ENV
+              value: /session/env
+          # Layer 5: Lifecycle. Caps so a runaway agent only hurts itself.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+          volumeMounts:
+            - name: session
+              mountPath: /session
+              readOnly: true
+      volumes:
+        # Only mounted into the sidecar. Audience 'infisical', so it can't be
+        # used against the Kubernetes API.
+        - name: infisical-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: infisical
+                  expirationSeconds: 600
+        - name: session
+          emptyDir:
+            medium: Memory
+  # Layer 4: Network. Default deny, then allow only DNS, the proxy, and Infisical.
+  networkPolicy:
+    ingress: []
+    egress:
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+            podSelector:
+              matchLabels:
+                k8s-app: kube-dns
+          # GKE answers DNS from a cache on each node first.
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: kube-system
+            podSelector:
+              matchLabels:
+                k8s-app: node-local-dns
+        ports:
+          - protocol: UDP
+            port: 53
+          - protocol: TCP
+            port: 53
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: agent-vault
+            podSelector:
+              matchLabels:
+                app: agent-vault-proxy
+        ports:
+          - protocol: TCP
+            port: 17323
+      - to:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: infisical
+            podSelector:
+              matchLabels:
+                app: infisical
+        ports:
+          - protocol: TCP
+            port: 8080
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: coding-agent
+  namespace: agents
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: coding-agent
